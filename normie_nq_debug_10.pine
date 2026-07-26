@@ -101,7 +101,7 @@ regimeElevatedTh     = input.float(1.05, "Elevated Threshold (ratio >)", group =
 regimeCompressedTh   = input.float(0.95, "Compressed Threshold (ratio <)", group = "Regime Filter")
 blockElevatedHours   = input.bool(true, "Block entries when hour is ELEVATED", group = "Regime Filter")
 blockCompressedHours = input.bool(false, "Block entries when hour is COMPRESSED", group = "Regime Filter")
-useDynamicStop       = input.bool(true, "Use Dynamic Regime-Scaled Stop", group = "Regime Filter")
+useDynamicStop       = input.bool(true, "Use Dynamic Regime-Scaled Stop", group = "Regime Filter")  // Validated: two independent backtests (this session + OG Claude), two real bugs found and fixed on OG's side (DST handling, regime-ratio lookup), both now agree dynamic beats flat 42.5. Confirmed live default.
 stopFloorMult        = input.float(0.5, "Dynamic Stop Floor Multiplier", group = "Regime Filter")
 stopCeilMult         = input.float(2.0, "Dynamic Stop Ceiling Multiplier", group = "Regime Filter")
 
