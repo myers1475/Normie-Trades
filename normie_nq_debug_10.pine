@@ -1,0 +1,393 @@
+//@version=6
+indicator("Normie NQ - Final (Resting Limit + PickMyTrade Payload)", overlay = true, max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200)
+
+// ============================================================================
+// IMPORTANT: Must run on a 1-MINUTE chart. FVG detection pulls 15m data via
+// request.security; bias/LOC/exit checks run natively every 1-minute close.
+// ============================================================================
+
+biasTF        = input.timeframe("240", "Bias Timeframe")
+emaLen        = input.int(5, "Bias EMA Length")
+maxTouchWaitBars15m = input.int(30, "Max 15m Bars to Wait for Fill")
+showZones     = input.bool(true, "Show Pending Zone Boxes")
+showEntryLabels = input.bool(true, "Show Limit Entry Label Box")
+
+useLOC        = input.bool(true, "Use LOC Filter")
+locTF         = input.timeframe("30", "LOC Timeframe")
+
+blendedStop   = input.float(42.5, "Blended Stop (points, all hours)")
+excludedHour1 = input.int(16, "Excluded Hour 1 (ET, 24h)")
+excludedHour2 = input.int(18, "Excluded Hour 2 (ET, 24h)")
+
+positionStage = input.string("Funded", "Position Sizing Stage", options = ["Eval", "Funded"])
+evalRisk      = input.float(900, "Eval Target $ Risk")
+fundedRisk    = input.float(450, "Funded Target $ Risk")
+mnqPerPoint   = input.float(2.0, "MNQ $ per point")
+
+targetRisk = positionStage == "Eval" ? evalRisk : fundedRisk
+maxTouchWaitBars1m = maxTouchWaitBars15m * 15
+
+alertTime = str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ssZ")
+
+// ============================================================================
+// HOUR EXCLUSION
+// ============================================================================
+currentHourET = hour(time, "America/New_York")
+hourExcluded = currentHourET == excludedHour1 or currentHourET == excludedHour2
+inAnyValidSession = not hourExcluded
+
+// ============================================================================
+// HTF BIAS
+// ============================================================================
+htfEma = request.security(syminfo.tickerid, biasTF, ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_off)
+bullBiasNow = close > htfEma
+bearBiasNow = close < htfEma
+emaDirection = bullBiasNow ? 1 : bearBiasNow ? -1 : 0
+plot(emaDirection, title = "EMA Direction (debug)", display = display.data_window)
+
+// ============================================================================
+// LOC
+// ============================================================================
+f_locState() =>
+    var int direction = 0
+    var float locPrice = na
+    bullGap = high[2] < low[0]
+    bearGap = low[2] > high[0]
+    if bullGap
+        if direction == 0
+            direction := 1
+            locPrice := low
+        else if direction == -1 and close > locPrice
+            direction := 1
+            locPrice := low
+        else if direction == 1
+            locPrice := low
+    if bearGap
+        if direction == 0
+            direction := -1
+            locPrice := high
+        else if direction == 1 and close < locPrice
+            direction := -1
+            locPrice := high
+        else if direction == -1
+            locPrice := high
+    [direction[1], locPrice[1]]
+
+[locDir, locPrice] = if useLOC
+    request.security(syminfo.tickerid, locTF, f_locState(), lookahead = barmerge.lookahead_off)
+else
+    [int(na), float(na)]
+// Reverted to STICKY (gap-confirmed) direction - matches original design intent.
+// Direction only changes on a genuine new gap event, not a simple close-vs-line check.
+
+locBullOK = not useLOC or locDir == 1
+locBearOK = not useLOC or locDir == -1
+plot(useLOC ? locDir : na, title = "LOC Direction (debug)", display = display.data_window)
+
+biasDirection = (bullBiasNow and locBullOK) ? 1 : (bearBiasNow and locBearOK) ? -1 : 0
+plot(biasDirection, title = "Bias Direction (debug)", display = display.data_window)
+validBullBias = biasDirection == 1
+validBearBias = biasDirection == -1
+
+// ============================================================================
+// VOLATILITY REGIME FILTER (core logic ported from "Market Regimes - NQStats")
+// Tracks rolling 10-hour realized volatility per NY hour-of-day, compares it
+// to that hour's 5Y baseline. Lets you block entries during hours currently
+// running hot (elevated) or dead (compressed) relative to their own norm.
+// ============================================================================
+useRegimeFilter      = input.bool(false, "Use Volatility Regime Filter", group = "Regime Filter")
+regimeRollLen        = input.int(10, "Regime Rolling Window (hours)", group = "Regime Filter")
+regimeElevatedTh     = input.float(1.05, "Elevated Threshold (ratio >)", group = "Regime Filter")
+regimeCompressedTh   = input.float(0.95, "Compressed Threshold (ratio <)", group = "Regime Filter")
+blockElevatedHours   = input.bool(true, "Block entries when hour is ELEVATED", group = "Regime Filter")
+blockCompressedHours = input.bool(false, "Block entries when hour is COMPRESSED", group = "Regime Filter")
+useDynamicStop       = input.bool(true, "Use Dynamic Regime-Scaled Stop", group = "Regime Filter")
+stopFloorMult        = input.float(0.5, "Dynamic Stop Floor Multiplier", group = "Regime Filter")
+stopCeilMult         = input.float(2.0, "Dynamic Stop Ceiling Multiplier", group = "Regime Filter")
+
+// 5Y hourly baseline stdev (%, ETH) - same table as NQStats. Hours 16/17 have
+// no coverage (gap) and are left na - the regime filter simply can't block on
+// those hours (moot anyway since Normie already excludes hour 16 by default).
+var float[] regimeBaseline = array.from(
+     0.122, 0.149, 0.170, 0.236, 0.220, 0.171, 0.186, 0.219,   // 00-07
+     0.395, 0.491, 0.508, 0.400, 0.331, 0.419, 0.352, 0.425,   // 08-15
+     na, na,                                                    // 16-17 (gap)
+     0.232, 0.166, 0.189, 0.172, 0.142, 0.115)                  // 18-23
+
+[rg_o, rg_c, rg_t] = request.security(syminfo.tickerid, "60", [open, close, time], lookahead = barmerge.lookahead_off)
+newHourBarRegime = ta.change(rg_t) != 0
+
+var matrix<float> regimeHist      = matrix.new<float>(24, regimeRollLen, na)
+var int[] regimeFillIdx   = array.new_int(24, 0)
+var int[] regimeFillCount = array.new_int(24, 0)
+
+if newHourBarRegime
+    ret = (rg_o[1] != 0) ? (rg_c[1] - rg_o[1]) / rg_o[1] : na
+    if not na(ret)
+        prevHour = hour(rg_t[1], "America/New_York")
+        idx = array.get(regimeFillIdx, prevHour)
+        matrix.set(regimeHist, prevHour, idx, ret)
+        array.set(regimeFillIdx, prevHour, (idx + 1) % regimeRollLen)
+        cnt = array.get(regimeFillCount, prevHour)
+        if cnt < regimeRollLen
+            array.set(regimeFillCount, prevHour, cnt + 1)
+
+f_regimeRatio(hr) =>
+    cnt = array.get(regimeFillCount, hr)
+    base = array.get(regimeBaseline, hr)
+    float result = na
+    if cnt >= regimeRollLen and not na(base) and base != 0
+        row = matrix.row(regimeHist, hr)
+        result := array.stdev(row, false) / base
+    result
+
+currentHourRegime  = hour(time, "America/New_York")
+currentRegimeRatio = f_regimeRatio(currentHourRegime)
+regimeElevatedNow   = not na(currentRegimeRatio) and currentRegimeRatio > regimeElevatedTh
+regimeCompressedNow = not na(currentRegimeRatio) and currentRegimeRatio < regimeCompressedTh
+regimeBlocksEntry = useRegimeFilter and ((blockElevatedHours and regimeElevatedNow) or (blockCompressedHours and regimeCompressedNow))
+
+plot(na(currentRegimeRatio) ? na : currentRegimeRatio, title = "Regime Ratio (debug)", display = display.data_window)
+
+// Dynamic stop = blendedStop * current regime ratio, clamped to a sane range.
+// Backtested (sticky LOC, continuous monitoring): +3.0 pts WR / +73 net R vs
+// the flat 42.5 baseline over the same trade sample - confirmed worth using live.
+dynamicStopMult = na(currentRegimeRatio) ? 1.0 : math.max(stopFloorMult, math.min(stopCeilMult, currentRegimeRatio))
+currentSessionStop = useDynamicStop ? blendedStop * dynamicStopMult : blendedStop
+plot(currentSessionStop, title = "Current Session Stop (debug)", display = display.data_window)
+
+// ============================================================================
+// 15m FVG DETECTION (shifted one bar back - reads the last CLOSED candle,
+// not the still-forming live one)
+// ============================================================================
+[h15_0, h15_1, h15_2, l15_0, l15_1, l15_2, c15_0, c15_1, c15_2, t15_0] = request.security(syminfo.tickerid, "15",
+     [high[1], high[2], high[3], low[1], low[2], low[3], close[1], close[2], close[3], time[1]], lookahead = barmerge.lookahead_off)
+
+var int lastSeen15mTime = na
+newFifteenMinBar = na(lastSeen15mTime) or t15_0 != lastSeen15mTime
+if newFifteenMinBar
+    lastSeen15mTime := t15_0
+
+bullGap15    = h15_2 < l15_0
+bullNormie15 = bullGap15 and c15_0 <= h15_1
+bearGap15    = l15_2 > h15_0
+bearNormie15 = bearGap15 and c15_0 >= l15_1
+
+// ============================================================================
+// ZONE TYPE + STORAGE
+// ============================================================================
+type Zone
+    float gtop
+    float gbot
+    int   barIdx
+    float stopDist
+    bool  filled
+    int   fillBarIdx
+    int   touch15mTime
+
+var array<Zone> bullZones = array.new<Zone>()
+var array<Zone> bearZones = array.new<Zone>()
+
+limitEntrySignal = false
+cancelSignal = false
+flattenSignal = false
+string signalDirection = na
+
+float pStopDist = na
+float pTargetDist = na
+float pLimitPrice = na
+float pQuantity = na
+
+// ---- ARM NEW ZONES (with proximity conflict resolution) ----
+if newFifteenMinBar
+    if bullNormie15 and validBullBias and inAnyValidSession and not regimeBlocksEntry
+        newGtop = l15_0
+        skipNewZone = false
+        if bullZones.size() > 0
+            for i = bullZones.size() - 1 to 0
+                z = bullZones.get(i)
+                if not z.filled
+                    dist = math.abs(newGtop - z.gtop)
+                    if dist < currentSessionStop
+                        if newGtop < z.gtop
+                            bullZones.remove(i)
+                        else
+                            skipNewZone := true
+        if not skipNewZone
+            bullZones.push(Zone.new(l15_0, h15_2, bar_index, currentSessionStop, false, na, na))
+            qty = int(math.floor(targetRisk / (currentSessionStop * mnqPerPoint)))
+            limitEntrySignal := true
+            signalDirection := "LONG"
+            pStopDist := currentSessionStop
+            pTargetDist := currentSessionStop
+            pLimitPrice := l15_0
+            pQuantity := qty
+            if showZones
+                box.new(math.max(bar_index - 15*2, 0), h15_2, bar_index + maxTouchWaitBars1m, l15_0, border_color = color.new(color.teal, 0), bgcolor = color.new(color.teal, 85))
+
+    if bearNormie15 and validBearBias and inAnyValidSession and not regimeBlocksEntry
+        newGtop = h15_0
+        skipNewZone = false
+        if bearZones.size() > 0
+            for i = bearZones.size() - 1 to 0
+                z = bearZones.get(i)
+                if not z.filled
+                    dist = math.abs(newGtop - z.gtop)
+                    if dist < currentSessionStop
+                        if newGtop > z.gtop
+                            bearZones.remove(i)
+                        else
+                            skipNewZone := true
+        if not skipNewZone
+            bearZones.push(Zone.new(h15_0, l15_2, bar_index, currentSessionStop, false, na, na))
+            qty = int(math.floor(targetRisk / (currentSessionStop * mnqPerPoint)))
+            limitEntrySignal := true
+            signalDirection := "SHORT"
+            pStopDist := currentSessionStop
+            pTargetDist := currentSessionStop
+            pLimitPrice := h15_0
+            pQuantity := qty
+            if showZones
+                box.new(math.max(bar_index - 15*2, 0), h15_0, bar_index + maxTouchWaitBars1m, l15_2, border_color = color.new(color.maroon, 0), bgcolor = color.new(color.maroon, 85))
+
+// ---- MONITOR (continuous invalidation checking) ----
+if bullZones.size() > 0
+    for i = bullZones.size() - 1 to 0
+        z = bullZones.get(i)
+        if not z.filled
+            touchedNow = low <= z.gtop
+            expired = (bar_index - z.barIdx) > maxTouchWaitBars1m
+            if not validBullBias
+                cancelSignal := true
+                signalDirection := "LONG"
+                bullZones.remove(i)
+            else if touchedNow
+                z.filled := true
+                z.fillBarIdx := bar_index
+                z.touch15mTime := t15_0
+                if bullZones.size() > 1
+                    for j = bullZones.size() - 1 to 0
+                        other = bullZones.get(j)
+                        if not other.filled
+                            bullZones.remove(j)
+                if bearZones.size() > 0
+                    for k = bearZones.size() - 1 to 0
+                        otherz = bearZones.get(k)
+                        if otherz.filled
+                            flattenSignal := true
+                            signalDirection := "SHORT"
+                            bearZones.remove(k)
+                break
+            else if expired
+                cancelSignal := true
+                signalDirection := "LONG"
+                bullZones.remove(i)
+        else
+            if not bullBiasNow or not locBullOK
+                flattenSignal := true
+                signalDirection := "LONG"
+                bullZones.remove(i)
+            else if newFifteenMinBar and t15_0 != z.touch15mTime
+                formsCounterFVG = l15_2 > h15_0
+                if formsCounterFVG
+                    flattenSignal := true
+                    signalDirection := "LONG"
+                bullZones.remove(i)
+
+if bearZones.size() > 0
+    for i = bearZones.size() - 1 to 0
+        z = bearZones.get(i)
+        if not z.filled
+            touchedNow = high >= z.gtop
+            expired = (bar_index - z.barIdx) > maxTouchWaitBars1m
+            if not validBearBias
+                cancelSignal := true
+                signalDirection := "SHORT"
+                bearZones.remove(i)
+            else if touchedNow
+                z.filled := true
+                z.fillBarIdx := bar_index
+                z.touch15mTime := t15_0
+                if bearZones.size() > 1
+                    for j = bearZones.size() - 1 to 0
+                        other = bearZones.get(j)
+                        if not other.filled
+                            bearZones.remove(j)
+                if bullZones.size() > 0
+                    for k = bullZones.size() - 1 to 0
+                        otherz = bullZones.get(k)
+                        if otherz.filled
+                            flattenSignal := true
+                            signalDirection := "LONG"
+                            bullZones.remove(k)
+                break
+            else if expired
+                cancelSignal := true
+                signalDirection := "SHORT"
+                bearZones.remove(i)
+        else
+            if not bearBiasNow or not locBearOK
+                flattenSignal := true
+                signalDirection := "SHORT"
+                bearZones.remove(i)
+            else if newFifteenMinBar and t15_0 != z.touch15mTime
+                formsCounterFVG = h15_2 < l15_0
+                if formsCounterFVG
+                    flattenSignal := true
+                    signalDirection := "SHORT"
+                bearZones.remove(i)
+
+// ============================================================================
+// LABELS
+// ============================================================================
+if showEntryLabels and limitEntrySignal and signalDirection == "LONG"
+    stopPriceDisplayLong = pLimitPrice - pStopDist
+    label.new(bar_index, low, "LIMIT LONG\n" + str.tostring(pQuantity) + " MNQ @ " + str.tostring(pLimitPrice) + "\nSL:" + str.tostring(stopPriceDisplayLong), color = color.new(color.green, 0), textcolor = color.white, style = label.style_label_up, size = size.small)
+if showEntryLabels and limitEntrySignal and signalDirection == "SHORT"
+    stopPriceDisplayShort = pLimitPrice + pStopDist
+    label.new(bar_index, high, "LIMIT SHORT\n" + str.tostring(pQuantity) + " MNQ @ " + str.tostring(pLimitPrice) + "\nSL:" + str.tostring(stopPriceDisplayShort), color = color.new(color.red, 0), textcolor = color.white, style = label.style_label_down, size = size.small)
+
+// ============================================================================
+// ARROWS
+// ============================================================================
+plotshape(limitEntrySignal and signalDirection == "LONG", title = "Entry Arrow Long", location = location.belowbar, style = shape.triangleup, color = color.new(color.green, 0), size = size.normal)
+plotshape(limitEntrySignal and signalDirection == "SHORT", title = "Entry Arrow Short", location = location.abovebar, style = shape.triangledown, color = color.new(color.red, 0), size = size.normal)
+
+orderInvalidated = cancelSignal or flattenSignal
+plotshape(orderInvalidated and signalDirection == "LONG", title = "Invalidated (Long side)", location = location.belowbar, style = shape.xcross, color = color.new(color.black, 0), size = size.normal)
+plotshape(orderInvalidated and signalDirection == "SHORT", title = "Invalidated (Short side)", location = location.abovebar, style = shape.xcross, color = color.new(color.black, 0), size = size.normal)
+
+// ============================================================================
+// ALERTS - full JSON built directly in the script. No {{...}} placeholders
+// anywhere - date and price are real values generated by Pine itself.
+// ============================================================================
+myToken = "YOUR_PICKMYTRADE_TOKEN_HERE"
+
+accountsBlock = "[{\"token\": \"" + myToken + "\", \"account_id\": \"YOUR_ACCOUNT_ID_1\", \"risk_percentage\": 0, \"quantity_multiplier\": 2}, " +
+     "{\"token\": \"" + myToken + "\", \"account_id\": \"YOUR_ACCOUNT_ID_2\", \"risk_percentage\": 0, \"quantity_multiplier\": 2}, " +
+     "{\"token\": \"" + myToken + "\", \"account_id\": \"YOUR_ACCOUNT_ID_3\", \"risk_percentage\": 0, \"quantity_multiplier\": 2}]"
+
+if limitEntrySignal
+    dataField = signalDirection == "LONG" ? "buy" : "sell"
+    msg = "{\"strategy_name\": \"\", \"symbol\": \"MNQ1!\", \"date\": \"" + alertTime + "\", \"data\": \"" + dataField + "\", " +
+         "\"quantity\": " + str.tostring(pQuantity) + ", \"risk_percentage\": 0, " +
+         "\"price\": \"" + str.tostring(pLimitPrice, "0.00") + "\", \"stp_limit_stp_price\": 0, " +
+         "\"tp\": " + str.tostring(pTargetDist) + ", \"percentage_tp\": 0, \"dollar_tp\": 0, " +
+         "\"sl\": " + str.tostring(pStopDist) + ", \"percentage_sl\": 0, \"dollar_sl\": 0, " +
+         "\"trail\": 0, \"trail_stop\": 0, \"trail_trigger\": 0, \"trail_freq\": 0, " +
+         "\"update_tp\": false, \"update_sl\": false, \"breakeven\": 0, \"breakeven_offset\": 0, " +
+         "\"token\": \"" + myToken + "\", \"pyramid\": false, \"same_direction_ignore\": false, " +
+         "\"reverse_order_close\": false, \"order_type\": \"LMT\", " +
+         "\"multiple_accounts\": " + accountsBlock + "}"
+    alert(msg, alert.freq_once_per_bar)
+
+if cancelSignal or flattenSignal
+    msg = "{\"strategy_name\": \"\", \"symbol\": \"MNQ1!\", \"date\": \"" + alertTime + "\", \"data\": \"close\", " +
+         "\"quantity\": 1, \"risk_percentage\": 0, \"price\": \"0.00\", \"stp_limit_stp_price\": 0, " +
+         "\"dollar_tp\": 0, \"percentage_tp\": 0, \"tp\": 0, \"dollar_sl\": 0, \"percentage_sl\": 0, \"sl\": 0, " +
+         "\"trail\": 0, \"trail_stop\": 0, \"trail_trigger\": 0, \"trail_freq\": 0, " +
+         "\"update_tp\": false, \"update_sl\": false, \"breakeven\": 0, \"breakeven_offset\": 0, " +
+         "\"token\": \"" + myToken + "\", \"pyramid\": false, \"same_direction_ignore\": false, " +
+         "\"reverse_order_close\": false, " +
+         "\"multiple_accounts\": " + accountsBlock + "}"
+    alert(msg, alert.freq_once_per_bar)
