@@ -1,0 +1,465 @@
+//@version=6
+indicator("Normie Excursion 4", overlay = true, max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200)
+
+// ============================================================================
+// NORMIE EXCURSION 4 - FIRES AT EXCURSION, NOT AT TOUCH
+//
+// Non-negotiable design requirement: the LMT order fires the instant
+// excursion crosses 10 points - not when price later comes back to touch
+// the entry level. This is a genuinely different moment in time, well
+// before touch, giving the order real time to rest on the broker's book in
+// advance rather than being sent reactively after a touch has already
+// happened.
+//
+// This creates a real distinction that didn't exist before: a zone can now
+// be in one of two states - PENDING (still building excursion, no order
+// exists anywhere yet) or LIVE (an order has been sent and is genuinely
+// resting on the broker's book, waiting for price to come back and fill
+// it). These are tracked separately, deliberately, because the correct
+// action on bias-flip or timeout is different for each: a pending zone
+// with no order yet just gets dropped silently, nothing to cancel. A live
+// order genuinely needs a cancel message sent to the broker.
+//
+// Three worked-through rules govern a live order once it exists:
+// 1) TIMEOUT: a live order gets its own clock, starting from the moment IT
+//    fired (not from when the zone originally armed). If price hasn't come
+//    back within maxTouchWaitBars1m bars of THAT, cancel it.
+// 2) BIAS FLIP: if bias flips while an order is live, cancel it
+//    immediately, no exception - this is a live commitment now, not a
+//    silent pending zone.
+// 3) ONLY ONE LIVE ORDER PER DIRECTION AT A TIME: if a different pending
+//    zone (same direction) also crosses its own excursion threshold while
+//    an order is already live, the new one cancels the old one first, then
+//    replaces it. (Long vs short can never collide - bullBiasNow and
+//    bearBiasNow are mutually exclusive by construction, so this only
+//    matters for same-direction collisions.)
+//
+// Excursion filter >=10pt, no ceiling. Stop = 13pt, 1:1R bracket, entry is
+// a genuine LMT order with tp/sl as absolute price levels.
+// ============================================================================
+
+// ---- SIGNAL PARAMETERS ----
+biasTF        = input.timeframe("15", "Bias Timeframe")
+emaLen        = input.int(5, "Bias EMA Length")
+maxTouchWaitBars1m = input.int(30, "Max Bars a Live Order Waits for Fill (from when it fired)")
+minAdverseExcursion = input.float(10.0, "Min Adverse Excursion Before Firing (points)")
+showZones     = input.bool(true, "Show Pending Zone Boxes")
+showEntryLabels = input.bool(true, "Show Entry Label Box")
+showWinLossLabels = input.bool(true, "Show Win/Loss Labels (visual only - does not affect trading, no alerts fired)")
+forceTestSignal = input.bool(false, "⚠ FORCE TEST ALERT (fires one fake SHORT entry via the real alert() call - TURN OFF after testing)")
+testFireTime = input.time(timestamp("2026-01-01 00:00"), "Force test fires once bar time reaches this (set 2-3 min in the future, EXCHANGE time)")
+
+fixedStop     = input.float(13.0, "Fixed Stop / Bracket Distance (points, 1:1R)")
+
+// ---- RISK (flat, no cap - no consistency rule once funded) ----
+baseRisk      = input.float(250.0, "Risk Per Trade ($)")
+mnqPerPoint   = input.float(2.0, "MNQ $ per point")
+maxQuantity   = input.int(30, "Max Quantity Per Signal (Flex 50K limit - confirm your account's actual multiplier/limit before live use)")
+
+alertTime = str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ssZ")
+
+// ============================================================================
+// ALERT SETUP
+// ============================================================================
+// same_direction_ignore is TRUE and pyramid is FALSE - together these are
+// PMT's own native protection against duplicate/stacking orders while a
+// position is already active. Found and enabled after a confirmed real
+// incident where the same order fired repeatedly within seconds, stacking
+// far past the intended 9-contract size. This strategy never intentionally
+// scales into a position - one zone, one order, no exceptions - so pyramid
+// has no legitimate use here and is fully disabled, removing any ambiguity
+// about how it might interact with same_direction_ignore. This protects at
+// the PMT layer regardless of what causes a duplicate alert to be sent,
+// independent of anything in this script's own state.
+//
+// All alert() calls now use alert.freq_once_per_bar_close, and the
+// replacement-cancel alert is removed entirely (relying on PMT's own
+// documented behavior that an entry alert already closes any existing
+// open position first). Both changes came from PMT's own documentation:
+// their troubleshooting guide specifically recommends "Once Per Bar
+// Close" for scripts sending conflicting signals on the same bar - our
+// exact symptom - and their indicator alert type is documented to close
+// any existing position before opening a new one, making a separate
+// cancel alert on the same bar unnecessary. This was found after
+// confirming, with a real trade, that alert.freq_once_per_bar only lets
+// the first of two same-bar alert() calls through - a real trade that
+// filled and won never actually reached the broker, because its cancel
+// (for the order it replaced) fired first and silently ate the slot.
+// The custom lastFireBar guard (below) was built specifically to stop
+// repeated same-bar firing and did not reliably hold - a confirmed real
+// incident showed the same order firing every ~8 seconds, eventually
+// tripping TradingView's own 15-triggers-per-3-minutes limit and getting
+// the alert disabled outright. Rather than trust another custom guard, this
+// leans on Pine's own built-in throttle instead. Tradeoff: this could
+// occasionally suppress a second, genuinely different signal qualifying on
+// the exact same bar - accepted as a much smaller cost than the alert
+// getting disabled. The lastFireBar guard is left in place as a second,
+// independent layer, not because it's proven reliable on its own.
+myToken = "YOUR_PICKMYTRADE_TOKEN_HERE"
+
+accountsText = input.text_area(
+     defval = "YOUR_ACCOUNT_ID_1,1.0\nYOUR_ACCOUNT_ID_2,1.0",
+     title = "Accounts (one per line: account_id,multiplier)")
+
+var string[] accountIds   = array.new_string()
+var float[]  accountMults = array.new_float()
+if barstate.isfirst
+    lines = str.split(accountsText, "\n")
+    for line in lines
+        if str.length(line) > 0
+            parts = str.split(line, ",")
+            if array.size(parts) == 2
+                array.push(accountIds, array.get(parts, 0))
+                array.push(accountMults, str.tonumber(array.get(parts, 1)))
+
+f_buildAccountsBlock() =>
+    string result = "["
+    for i = 0 to array.size(accountIds) - 1
+        acctId = array.get(accountIds, i)
+        mult = array.get(accountMults, i)
+        result := result + "{\"token\": \"" + myToken + "\", \"account_id\": \"" + acctId + "\", \"risk_percentage\": 0, \"quantity_multiplier\": " + str.tostring(mult) + "}"
+        if i < array.size(accountIds) - 1
+            result := result + ", "
+    result := result + "]"
+    result
+
+accountsBlock = f_buildAccountsBlock()
+
+// tp/sl are ABSOLUTE PRICE LEVELS, not point distances.
+f_entryMsg(dirStr, limitPrice, stopDist, qty) =>
+    dataField = dirStr == "LONG" ? "long" : "short"
+    slPrice = dirStr == "LONG" ? limitPrice - stopDist : limitPrice + stopDist
+    tpPrice = dirStr == "LONG" ? limitPrice + stopDist : limitPrice - stopDist
+    "{\"strategy_name\": \"\", \"symbol\": \"MNQ1!\", \"date\": \"" + alertTime + "\", \"data\": \"" + dataField + "\", " +
+         "\"quantity\": " + str.tostring(qty) + ", \"risk_percentage\": 0, " +
+         "\"price\": \"" + str.tostring(limitPrice, "0.00") + "\", \"stp_limit_stp_price\": 0, " +
+         "\"tp\": " + str.tostring(tpPrice, "0.00") + ", \"percentage_tp\": 0, \"dollar_tp\": 0, " +
+         "\"sl\": " + str.tostring(slPrice, "0.00") + ", \"percentage_sl\": 0, \"dollar_sl\": 0, " +
+         "\"trail\": 0, \"trail_stop\": 0, \"trail_trigger\": 0, \"trail_freq\": 0, " +
+         "\"update_tp\": false, \"update_sl\": false, \"breakeven\": 0, \"breakeven_offset\": 0, " +
+         "\"token\": \"" + myToken + "\", \"pyramid\": false, \"same_direction_ignore\": true, " +
+         "\"reverse_order_close\": true, \"order_type\": \"LMT\", " +
+         "\"multiple_accounts\": " + accountsBlock + "}"
+
+f_cancelMsg() =>
+    "{\"strategy_name\": \"\", \"symbol\": \"MNQ1!\", \"date\": \"" + alertTime + "\", \"data\": \"flat\", " +
+         "\"quantity\": 1, \"risk_percentage\": 0, \"price\": \"0.00\", \"order_type\": \"MKT\", \"stp_limit_stp_price\": 0, " +
+         "\"dollar_tp\": 0, \"percentage_tp\": 0, \"tp\": 0, \"dollar_sl\": 0, \"percentage_sl\": 0, \"sl\": 0, " +
+         "\"trail\": 0, \"trail_stop\": 0, \"trail_trigger\": 0, \"trail_freq\": 0, " +
+         "\"update_tp\": false, \"update_sl\": false, \"breakeven\": 0, \"breakeven_offset\": 0, " +
+         "\"token\": \"" + myToken + "\", \"pyramid\": false, \"same_direction_ignore\": true, " +
+         "\"reverse_order_close\": true, \"full_closed\": true, " +
+         "\"multiple_accounts\": " + accountsBlock + "}"
+
+// ============================================================================
+// BIAS (15m EMA5)
+// ============================================================================
+htfEma = request.security(syminfo.tickerid, biasTF, ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_off)
+bullBiasNow = close > htfEma
+bearBiasNow = close < htfEma
+emaDirection = bullBiasNow ? 1 : bearBiasNow ? -1 : 0
+plot(emaDirection, title = "EMA Direction (debug)", display = display.data_window)
+
+// ============================================================================
+// 1m FVG DETECTION
+// ============================================================================
+bullGap1    = high[3] < low[1]
+bullNormie1 = bullGap1 and close[1] <= high[2]
+bearGap1    = low[3] > high[1]
+bearNormie1 = bearGap1 and close[1] >= low[2]
+
+// ============================================================================
+// ZONE TYPE (PENDING - still building excursion, no order exists yet)
+// ============================================================================
+type Zone
+    float gtop
+    float gbot
+    int   barIdx
+    float maxAdverse
+
+var array<Zone> bullZones = array.new<Zone>()
+var array<Zone> bearZones = array.new<Zone>()
+
+// ============================================================================
+// LIVE ORDER TYPE (an order has genuinely been sent and is resting on the
+// broker's book, waiting for price to come back and fill it). At most one
+// per direction can exist at a time.
+// ============================================================================
+type LiveOrder
+    float entryPrice
+    float extreme
+    int   firedBarIdx
+
+var LiveOrder bullLive = na
+var LiveOrder bearLive = na
+
+// ---- PURELY VISUAL WIN/LOSS TRACKING ----
+// Completely separate from the actual trade logic - fires no alerts, sends
+// no signals. Only draws a W/L label once a position this script already
+// told the broker about would have hit its bracket. Pushed to only once
+// price has genuinely, naturally touched a live order's entry level -
+// mirroring when the position actually opens.
+type OpenPosition
+    float entryPrice
+    float targetPrice
+    float stopPrice
+    string dir
+    int   fillBarIdx
+
+var array<OpenPosition> openPositions = array.new<OpenPosition>()
+
+cancelSignal = false
+entrySentSignal = false
+string signalDirection = na
+float pStopDist = na
+float pLimitPrice = na
+float pQuantity = na
+
+// ---- FORCE TEST SIGNAL (debug only) ----
+var bool testAlertFired = false
+if forceTestSignal and not testAlertFired and time >= testFireTime
+    testAlertFired := true
+    testEntry = close + fixedStop
+    alert(f_entryMsg("SHORT", testEntry, fixedStop, 1), alert.freq_once_per_bar_close)
+    entrySentSignal := true
+    signalDirection := "SHORT"
+    pStopDist := fixedStop
+    pLimitPrice := testEntry
+    pQuantity := 1
+
+// ============================================================================
+// ARM NEW PENDING ZONES - real-time, per-bar-guarded against duplicate
+// re-arming from intrabar re-execution.
+// ============================================================================
+var int lastBullArmBar = -1
+var int lastBearArmBar = -1
+var int lastBullFireBar = -1
+var int lastBearFireBar = -1
+
+if bullNormie1 and bullBiasNow and bar_index != lastBullArmBar
+    newGtop = low[1]
+    zonesToRemove = array.new_int()
+    if bullZones.size() > 0
+        for i = bullZones.size() - 1 to 0
+            z = bullZones.get(i)
+            dist = math.abs(newGtop - z.gtop)
+            if dist < fixedStop
+                // Newest always wins, unconditionally - no price comparison.
+                // Matches the same rule already used for replacing a live
+                // order: a more recent zone reflects more current price
+                // action than an older one, regardless of which price
+                // looks better on paper. This still only ever allows ONE
+                // pending zone within fixedStop of any price at a time -
+                // the old one is removed before the new one is added, never
+                // both at once.
+                zonesToRemove.push(i)
+    if zonesToRemove.size() > 0
+        for idx in zonesToRemove
+            bullZones.remove(idx)
+    bullZones.push(Zone.new(low[1], high[3], bar_index, 0.0))
+    lastBullArmBar := bar_index
+    if showZones
+        box.new(math.max(bar_index - 3, 0), high[3], bar_index + maxTouchWaitBars1m, low[1], border_color = color.new(color.teal, 0), bgcolor = color.new(color.teal, 85))
+
+if bearNormie1 and bearBiasNow and bar_index != lastBearArmBar
+    newGtop = high[1]
+    zonesToRemove = array.new_int()
+    if bearZones.size() > 0
+        for i = bearZones.size() - 1 to 0
+            z = bearZones.get(i)
+            dist = math.abs(newGtop - z.gtop)
+            if dist < fixedStop
+                zonesToRemove.push(i)
+    if zonesToRemove.size() > 0
+        for idx in zonesToRemove
+            bearZones.remove(idx)
+    bearZones.push(Zone.new(high[1], low[3], bar_index, 0.0))
+    lastBearArmBar := bar_index
+    if showZones
+        box.new(math.max(bar_index - 3, 0), high[1], bar_index + maxTouchWaitBars1m, low[3], border_color = color.new(color.maroon, 0), bgcolor = color.new(color.maroon, 85))
+
+// ============================================================================
+// MANAGE THE LIVE BULL ORDER (if one exists): bias-flip cancel, timeout
+// cancel, or natural fill detection (for visual W/L tracking only - the
+// broker's own book is what actually fills it, not this script).
+// ============================================================================
+if not na(bullLive)
+    if not bullBiasNow
+        cancelSignal := true
+        signalDirection := "LONG"
+        alert(f_cancelMsg(), alert.freq_once_per_bar_close)
+        bullLive := na
+    else if (bar_index - bullLive.firedBarIdx) > maxTouchWaitBars1m
+        cancelSignal := true
+        signalDirection := "LONG"
+        alert(f_cancelMsg(), alert.freq_once_per_bar_close)
+        bullLive := na
+    else if low <= bullLive.entryPrice
+        // Natural fill - the broker's resting order fills itself. This
+        // script sends nothing here; just starts the visual W/L tracker.
+        if showWinLossLabels
+            openPositions.push(OpenPosition.new(bullLive.entryPrice, bullLive.entryPrice + fixedStop, bullLive.entryPrice - fixedStop, "LONG", bar_index))
+        bullLive := na
+    else if close < bullLive.extreme
+        // Mitigated - checked AFTER touch, so a genuine fill on this same
+        // bar always takes priority over mitigation, matching the decision
+        // that a real touch happening first in time should never be
+        // discarded just because the same bar's close also breaches the
+        // gap. Only reached if no touch happened this bar.
+        cancelSignal := true
+        signalDirection := "LONG"
+        alert(f_cancelMsg(), alert.freq_once_per_bar_close)
+        bullLive := na
+
+// ============================================================================
+// MANAGE THE LIVE BEAR ORDER (same logic, mirrored)
+// ============================================================================
+if not na(bearLive)
+    if not bearBiasNow
+        cancelSignal := true
+        signalDirection := "SHORT"
+        alert(f_cancelMsg(), alert.freq_once_per_bar_close)
+        bearLive := na
+    else if (bar_index - bearLive.firedBarIdx) > maxTouchWaitBars1m
+        cancelSignal := true
+        signalDirection := "SHORT"
+        alert(f_cancelMsg(), alert.freq_once_per_bar_close)
+        bearLive := na
+    else if high >= bearLive.entryPrice
+        if showWinLossLabels
+            openPositions.push(OpenPosition.new(bearLive.entryPrice, bearLive.entryPrice - fixedStop, bearLive.entryPrice + fixedStop, "SHORT", bar_index))
+        bearLive := na
+    else if close > bearLive.extreme
+        cancelSignal := true
+        signalDirection := "SHORT"
+        alert(f_cancelMsg(), alert.freq_once_per_bar_close)
+        bearLive := na
+
+// ============================================================================
+// MONITOR PENDING BULL ZONES: track excursion, fire the INSTANT it crosses
+// the threshold - not at touch. Cancel silently (no alert - nothing was
+// ever sent to the broker for a still-pending zone) on bias-flip or
+// expiry-without-ever-reaching-threshold.
+// ============================================================================
+if bullZones.size() > 0
+    for i = bullZones.size() - 1 to 0
+        z = bullZones.get(i)
+        expired = (bar_index - z.barIdx) > maxTouchWaitBars1m
+        if not bullBiasNow
+            bullZones.remove(i)
+        else if close < z.gbot
+            // Mitigated - a candle CLOSED through C1's extreme while this
+            // zone was still pending. The gap is dead, never eligible
+            // again, regardless of how much excursion had built up.
+            bullZones.remove(i)
+        else
+            adverseNow = math.max(0.0, high - z.gtop)
+            wasQualified = z.maxAdverse >= minAdverseExcursion
+            z.maxAdverse := math.max(z.maxAdverse, adverseNow)
+            nowQualified = z.maxAdverse >= minAdverseExcursion
+            if nowQualified and not wasQualified
+                // Excursion just crossed the threshold. The guard below
+                // ensures this fires at most ONCE per bar_index, no matter
+                // how many times this gets re-evaluated on intrabar ticks -
+                // a real, confirmed bug showed the same zone firing 5
+                // separate times within one still-forming bar, stacking a
+                // single 9-contract order into 27+. If blocked by the
+                // guard, the zone is still removed rather than left to
+                // linger un-fireable (its qualification won't transition
+                // again since maxAdverse never decreases).
+                if bar_index != lastBullFireBar
+                    if not na(bullLive)
+                        // No longer sending a separate cancel alert here.
+                        // PMT's own documentation states an indicator entry
+                        // alert already closes any existing open position
+                        // (any direction) before opening the new one - the
+                        // separate cancel was a second alert() call on the
+                        // same bar, which Pine's freq_once_per_bar throttle
+                        // was silently dropping, confirmed by a real trade
+                        // that filled and won but never actually reached
+                        // the broker. The visual marker still shows this
+                        // was a replacement, just without a second real
+                        // alert firing.
+                        cancelSignal := true
+                        signalDirection := "LONG"
+                    qty = math.min(int(math.floor(baseRisk / (fixedStop * mnqPerPoint))), maxQuantity)
+                    alert(f_entryMsg("LONG", z.gtop, fixedStop, qty), alert.freq_once_per_bar_close)
+                    entrySentSignal := true
+                    signalDirection := "LONG"
+                    pStopDist := fixedStop
+                    pLimitPrice := z.gtop
+                    pQuantity := qty
+                    bullLive := LiveOrder.new(z.gtop, z.gbot, bar_index)
+                    lastBullFireBar := bar_index
+                    if showEntryLabels
+                        label.new(bar_index, low, "LMT SENT (LONG)\n" + str.tostring(qty) + " MNQ @ " + str.tostring(z.gtop) + "\nTP:" + str.tostring(z.gtop + fixedStop) + "  SL:" + str.tostring(z.gtop - fixedStop), color = color.new(color.green, 0), textcolor = color.white, style = label.style_label_up, size = size.small)
+                bullZones.remove(i)
+            else if expired
+                bullZones.remove(i)
+
+// ============================================================================
+// MONITOR PENDING BEAR ZONES (same logic, mirrored)
+// ============================================================================
+if bearZones.size() > 0
+    for i = bearZones.size() - 1 to 0
+        z = bearZones.get(i)
+        expired = (bar_index - z.barIdx) > maxTouchWaitBars1m
+        if not bearBiasNow
+            bearZones.remove(i)
+        else if close > z.gbot
+            bearZones.remove(i)
+        else
+            adverseNow = math.max(0.0, z.gtop - low)
+            wasQualified = z.maxAdverse >= minAdverseExcursion
+            z.maxAdverse := math.max(z.maxAdverse, adverseNow)
+            nowQualified = z.maxAdverse >= minAdverseExcursion
+            if nowQualified and not wasQualified
+                if bar_index != lastBearFireBar
+                    if not na(bearLive)
+                        cancelSignal := true
+                        signalDirection := "SHORT"
+                    qty = math.min(int(math.floor(baseRisk / (fixedStop * mnqPerPoint))), maxQuantity)
+                    alert(f_entryMsg("SHORT", z.gtop, fixedStop, qty), alert.freq_once_per_bar_close)
+                    entrySentSignal := true
+                    signalDirection := "SHORT"
+                    pStopDist := fixedStop
+                    pLimitPrice := z.gtop
+                    pQuantity := qty
+                    bearLive := LiveOrder.new(z.gtop, z.gbot, bar_index)
+                    lastBearFireBar := bar_index
+                    if showEntryLabels
+                        label.new(bar_index, high, "LMT SENT (SHORT)\n" + str.tostring(qty) + " MNQ @ " + str.tostring(z.gtop) + "\nTP:" + str.tostring(z.gtop - fixedStop) + "  SL:" + str.tostring(z.gtop + fixedStop), color = color.new(color.red, 0), textcolor = color.white, style = label.style_label_down, size = size.small)
+                bearZones.remove(i)
+            else if expired
+                bearZones.remove(i)
+
+// Check open (visually-tracked) positions against their bracket every bar.
+if showWinLossLabels and openPositions.size() > 0
+    for i = openPositions.size() - 1 to 0
+        p = openPositions.get(i)
+        hitTarget = bar_index > p.fillBarIdx and (p.dir == "LONG" ? high >= p.targetPrice : low <= p.targetPrice)
+        hitStop = bar_index > p.fillBarIdx and (p.dir == "LONG" ? low <= p.stopPrice : high >= p.stopPrice)
+        if hitTarget or hitStop
+            outcomeText = (hitTarget and hitStop) ? "SCR" : hitTarget ? "W" : "L"
+            outcomeColor = (hitTarget and hitStop) ? color.gray : hitTarget ? color.new(color.green, 0) : color.new(color.red, 0)
+            label.new(bar_index, p.dir == "LONG" ? low : high, outcomeText, color = outcomeColor, textcolor = color.white, style = p.dir == "LONG" ? label.style_label_down : label.style_label_up, size = size.small)
+            openPositions.remove(i)
+
+// ============================================================================
+// ARROWS (cosmetic only)
+// ============================================================================
+plotshape(entrySentSignal and signalDirection == "LONG", title = "Order Sent Long", location = location.belowbar, style = shape.triangleup, color = color.new(color.green, 0), size = size.normal)
+plotshape(entrySentSignal and signalDirection == "SHORT", title = "Order Sent Short", location = location.abovebar, style = shape.triangledown, color = color.new(color.red, 0), size = size.normal)
+
+plotshape(cancelSignal and signalDirection == "LONG", title = "Cancelled (Long side)", location = location.belowbar, style = shape.xcross, color = color.new(color.black, 0), size = size.normal)
+plotshape(cancelSignal and signalDirection == "SHORT", title = "Cancelled (Short side)", location = location.abovebar, style = shape.xcross, color = color.new(color.black, 0), size = size.normal)
+
+// ============================================================================
+// STATUS BOX
+// ============================================================================
+var table statusTable = table.new(position.bottom_right, 2, 2, border_width = 1)
+if barstate.islast
+    table.cell(statusTable, 0, 0, "Stop/TP", bgcolor = color.new(color.black, 0), text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 0, str.tostring(fixedStop, "0.0") + " pts (1:1R)", bgcolor = color.new(color.navy,0), text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 0, 1, "Risk/Trade", bgcolor = color.new(color.black, 0), text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 1, "$" + str.tostring(baseRisk, "0"), bgcolor = color.new(color.navy,0), text_color = color.white, text_size = size.small)
