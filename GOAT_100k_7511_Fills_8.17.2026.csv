@@ -1,0 +1,2 @@
+_id,_orderId,_contractId,_timestamp,_tradeDate,_action,_qty,_price,_active,_accountId,Fill ID,Order ID,Timestamp,Date,Account,B/S,Quantity,Price,_priceFormat,_priceFormatType,_tickSize,Contract,Product,Product Description,commission
+621225921488,621225921462,4399654,2026-08-17 04:24:34.264Z,2026-08-17,1,6,30243.5,true,61957201,621225921488,621225921462,08/17/2026 00:24:34,8/17/26,GFTEFLEXMATT67511, Sell,6,30243.50,-2,0,0.25,MNQU6,MNQ,Micro E-mini NASDAQ-100,2.34
