@@ -1,0 +1,919 @@
+//@version=6
+// MNQ FLOW TRADING IN STRUCTURES  —  v39
+// Dual zigzag structure, auto key levels, big-bar marking, broadening formation + fade arrow,
+// and N3/M3/F3 thirds drawn on the current OUTER leg when the outer structure is trending.
+//
+// v9 adds the BROADENING FORMATION and its FADE ARROW.
+// The BF is drawn his way: anchored on the newest pivot and projected forward, upper line
+// through the last two highs (ascending), lower through the last two lows (descending).
+// FADE ARROW fires when price touches the LOWER line and the bar closes back up off it.
+// Measured: lower-line fades +0.422R over 490 trades; upper-line fades +0.090R and are
+// left unmarked by default. A bar closing away from the line beats one closing on it
+// (+0.346R vs +0.120R), which is why the close test is part of the trigger.
+//
+// v8 adds BIG-BAR MARKING. A bar whose range exceeds a multiple of the recent average
+// range is coloured, because on those bars the stop has to sit much further away and the
+// second and third scale-in contracts perform far worse (leg-2 win rate 29% on big bars vs
+// 56% on normal ones, measured on the Jan-Feb replay). Rule: big bar = take leg 1 only.
+// The threshold is a MULTIPLE, not a fixed point value, so it tracks volatility.
+//
+// v7: key levels now respect BOTH the structure toggle and their own checkbox.
+// Unchecking "Show outer" hides the outer legs, labels AND its key levels; the
+// per-zigzag level checkboxes still work independently, so you can keep a zigzag
+// visible while turning just its levels off. Hidden levels are kept alive rather
+// than deleted, so re-checking the box brings them straight back with their state
+// (untested / tested / broken) intact.
+//
+// Level colour comes from the PIVOT TYPE, fixed at creation:
+//     HH or HL  →  bullish colour        LL or LH  →  bearish colour
+// so the line always agrees with the label above it.
+//
+// Level states, shown by opacity only:
+//   UNTESTED  full opacity · TESTED  part faded · BROKEN  most faded
+// A level retires only when the structure that produced it is invalidated — a bullish
+// level on a close below the defining low, a bearish level on a close above the
+// defining high. Closing through a level does not kill it; these behave as zones.
+//
+// Structure engine matches "Double Zig Zag with HHLL" (LonesomeTheBlue).
+
+indicator("MNQ FLOW Trading in Structures", "FLOW v39", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200,
+     max_bars_back = 3000)
+
+// ══════════════════════════════════════════════════════════════════
+gO = "① Outer structure"
+oOn     = input.bool(true,  "Show outer",              group = gO)
+oPrd    = input.int(9, "Period", minval = 2, maxval = 50, group = gO)
+oUp     = input.color(color.white, "Up", inline = "oc",   group = gO)
+oDn     = input.color(#2962ff,     "Down", inline = "oc", group = gO)
+oW      = input.int(2, "Width", minval = 1, maxval = 6, inline = "oc", group = gO)
+oStyle  = input.string("Solid", "Line style", options = ["Solid","Dashed","Dotted"], group = gO)
+oLbl    = input.bool(true, "Labels", inline = "ol", group = gO)
+oStrict = input.bool(true, "Only label CONFIRMED OS levels", group = gO,
+     tooltip = "A low is only an HL once a new HH prints after it. Until then it is interior structure and gets no OS label - the deepest such low is marked separately as P-HL.")
+oLblSz  = input.string("Normal", "Size", options = ["Tiny","Small","Normal","Large","Huge"], inline = "ol", group = gO)
+oOff    = input.float(0.7, "Label offset (ATR)", minval = 0, maxval = 5, step = 0.1, group = gO)
+
+gI = "② Inner structure"
+iOn     = input.bool(true,  "Show inner",              group = gI)
+iPrd    = input.int(2, "Period", minval = 2, maxval = 50, group = gI)
+iUp     = input.color(#089981, "Up", inline = "ic",    group = gI)
+iDn     = input.color(#f23645, "Down", inline = "ic",  group = gI)
+iW      = input.int(1, "Width", minval = 1, maxval = 6, inline = "ic", group = gI)
+iStyle  = input.string("Dotted", "Line style", options = ["Solid","Dashed","Dotted"], group = gI)
+iLbl    = input.bool(false, "Labels", inline = "il", group = gI)
+iLblSz  = input.string("Tiny", "Size", options = ["Tiny","Small","Normal","Large","Huge"], inline = "il", group = gI)
+iOff    = input.float(0.0, "Label offset (ATR)", minval = 0, maxval = 5, step = 0.1, group = gI)
+
+gK = "③ Key levels"
+kOuterOn = input.bool(false, "Outer levels", inline = "kon", group = gK,
+     tooltip = "Also requires 'Show outer' to be ticked.")
+kInnerOn = input.bool(false, "Inner levels", inline = "kon", group = gK,
+     tooltip = "Also requires 'Show inner' to be ticked.")
+kMode    = input.string("Persist until structure breaks", "Lifecycle",
+     options = ["Persist until structure breaks","Newest N pivots only"], group = gK)
+kRecent  = input.int(2, "N (Newest-N mode only)", minval = 1, maxval = 6, group = gK)
+kMax     = input.int(24, "Max live levels per zigzag", minval = 4, maxval = 60, group = gK)
+
+gKS = "③a Level state"
+tUntest = input.int(0,  "Untested opacity", minval = 0, maxval = 90, inline = "s1", group = gKS)
+tTested = input.int(40, "Tested",           minval = 0, maxval = 95, inline = "s1", group = gKS)
+tBroken = input.int(72, "Broken",           minval = 0, maxval = 98, inline = "s1", group = gKS)
+ovBroken= input.bool(false, "Override style when broken", inline = "s2", group = gKS)
+stBroken= input.string("Dotted", "", options = ["Solid","Dashed","Dotted"], inline = "s2", group = gKS)
+
+gKO = "③b Outer level style   (HH/HL bullish · LL/LH bearish)"
+kOBull  = input.color(color.white, "Bullish", inline = "ko1", group = gKO)
+kOBear  = input.color(#2962ff,     "Bearish", inline = "ko1", group = gKO)
+kOW     = input.int(2, "Width", minval = 1, maxval = 5, inline = "ko2", group = gKO)
+kOSt    = input.string("Solid", "Style", options = ["Solid","Dashed","Dotted"], inline = "ko2", group = gKO)
+
+gKI = "③c Inner level style"
+kIBull  = input.color(#089981, "Bullish", inline = "ki1", group = gKI)
+kIBear  = input.color(#f23645, "Bearish", inline = "ki1", group = gKI)
+kIW     = input.int(3, "Width", minval = 1, maxval = 5, inline = "ki2", group = gKI)
+kISt    = input.string("Dotted", "Style", options = ["Solid","Dashed","Dotted"], inline = "ki2", group = gKI)
+
+gK2 = "③d Level display"
+kExt    = input.int(20, "Extend right (bars)", minval = 0, maxval = 200, group = gK2)
+kPrice  = input.bool(false, "Price tag on levels", group = gK2)
+
+gB = "⑤ Big bars   (leg 1 only — no adds)"
+bbOn    = input.bool(true,  "Mark big bars", group = gB)
+bbMult  = input.float(1.3, "Big when range exceeds this x the average", minval = 1.0, maxval = 5.0, step = 0.05, group = gB,
+     tooltip = "1.3 means the bar's high-to-low range is 30% larger than the recent average range.")
+bbLen   = input.int(20, "Bars in the average", minval = 5, maxval = 200, group = gB)
+bbRTH   = input.bool(true, "Measure the average from RTH bars only", group = gB,
+     tooltip = "Overnight bars are about half the size of RTH bars, so an all-session average shrinks in the evening and flags candles that are not actually big. Anchoring to RTH keeps the threshold at daytime scale.")
+bbFloor = input.float(30, "Also require at least this many points", minval = 0, maxval = 500, step = 5, group = gB,
+     tooltip = "A hard floor so a small bar never qualifies no matter how quiet the average has gone. 0 disables it.")
+bbBull  = input.color(#ffc400, "Big BULL bar", inline = "bb1", group = gB)
+bbBear  = input.color(#00b0ff, "Big BEAR bar", inline = "bb1", group = gB)
+bbBody  = input.bool(true, "Colour the body", inline = "bb2", group = gB)
+bbWick  = input.bool(true, "Colour the wicks", inline = "bb2", group = gB)
+bbBord  = input.bool(true, "Colour the border", inline = "bb2", group = gB)
+bbRead  = input.bool(true, "Show the live multiple on the last bar", group = gB)
+bbTxt   = input.color(color.black, "Readout text colour", group = gB)
+bbAlert = input.bool(true, "Enable big-bar alert", group = gB)
+
+gW = "⑥ Broadening formation + fade arrow"
+bfOn    = input.bool(true, "Draw the broadening formation", group = gW)
+bfOuter = input.bool(true,  "Outer formation",  inline = "wsrc", group = gW)
+bfInner = input.bool(true,  "Inner formation",  inline = "wsrc", group = gW)
+bfMinW  = input.float(6.0, "Only if at least this wide (x ATR)", minval = 0, maxval = 20, step = 0.5, group = gW,
+     tooltip = "Wider formations tested better. 6 ATR is roughly 320 pts at current volatility.")
+bfOU    = input.color(#ab47bc, "Outer upper", inline = "w1", group = gW)
+bfOD    = input.color(#7e57c2, "Outer lower", inline = "w1", group = gW)
+bfIU    = input.color(#00e5ff, "Inner upper", inline = "w2", group = gW)
+bfID    = input.color(#00897b, "Inner lower", inline = "w2", group = gW)
+bfW     = input.int(1, "Width", minval = 1, maxval = 4, inline = "w1", group = gW)
+bfSt    = input.string("Dashed", "Style", options = ["Solid","Dashed","Dotted"], inline = "w1", group = gW)
+bfExt   = input.int(30, "Project forward (bars)", minval = 0, maxval = 200, group = gW)
+bfShape = input.string("Independent", "Which shapes to draw",
+     options = ["Independent","Both required","Any same-label pair"], group = gW,
+     tooltip = "Independent (his rule): the UPPER line draws whenever the highs are ascending and the LOWER whenever the lows are descending, each on its own. In an uptrend you get an upper line and no lower - that is correct, the lows are not descending. Both required: neither draws unless the formation is fully broadening. Any same-label pair also draws contractions and channels, which is what produced an upper line pointing down and a lower pointing up.")
+bfSpan  = input.bool(true, "Never project further than the anchors are apart", group = gW,
+     tooltip = "Inner pivots sit 2-5 bars apart, so their slope is measured over almost no run and comes out enormous - 10 pts/bar is normal. Projected 30 bars that line overtakes the other one and the pair inverts. Capping the projection to the anchor span fixes it without touching the slope.")
+bfMinSepI = input.int(1, "Minimum bars between INNER anchors", minval = 1, maxval = 50, group = gW,
+     tooltip = "Inner pivots sit 2-5 bars apart, so a threshold of 3 rejects most inner pairs outright. 1 keeps them.")
+bfMinSep = input.int(3, "Minimum bars between OUTER anchors", minval = 1, maxval = 50, group = gW,
+     tooltip = "Ignore a pair anchored closer than this - the slope is meaningless over one or two bars.")
+fdOn    = input.bool(true, "Fade arrow on the LOWER line", inline = "w2", group = gW)
+fdUpOn  = input.bool(false, "Also the upper line", inline = "w2", group = gW,
+     tooltip = "Off by default: upper-line fades measured +0.090R vs +0.422R for the lower.")
+fdReq   = input.bool(true, "Require the bar to close back off the line", group = gW)
+fdBull  = input.color(#00e676, "Long fade", inline = "w3", group = gW)
+fdBear  = input.color(#ff5252, "Short fade", inline = "w3", group = gW)
+fdSz    = input.string("Small", "Arrow size", options = ["Tiny","Small","Normal","Large"], inline = "w3", group = gW)
+fdOff   = input.float(2.5, "Push the arrow clear of the bar (x ATR)", minval = 0, maxval = 12, step = 0.25, group = gW,
+     tooltip = "Your pivot labels sit 0.7 ATR off the bar and the box extends further, so this needs to clear both. Raise until it looks right.")
+fdAuto  = input.bool(true, "Auto-clear the pivot label on the same bar", group = gW,
+     tooltip = "When a pivot label prints on the same bar as the arrow, add extra room automatically.")
+bfDiag  = input.bool(true, "Show why no formation is drawn", group = gW)
+
+gT = "⑦ Leg thirds   (N3 / M3 / F3, trending OS only)"
+t3On    = input.bool(true, "Show the thirds on the current outer leg", group = gT,
+     tooltip = "Only drawn when the outer structure reads HH+HL or LL+LH. In a broadening or contracting state there is no trend to measure against, so nothing is drawn.")
+t3Src   = input.string("Outer", "Measure the leg from", options = ["Outer","Inner"], group = gT)
+t3Depth = input.int(6, "How many pivots back to look for the dominant leg", minval = 2, maxval = 10, group = gT)
+t3Min   = input.float(0, "Only if the leg is at least this many ATR", minval = 0, maxval = 20, step = 0.5, group = gT)
+t3N     = input.color(#00c853, "N3 nearest the anchor (green)", group = gT)
+t3M     = input.color(#ffd600, "M3 middle (yellow)",            group = gT)
+t3F     = input.color(#ff1744, "F3 furthest (red)",             group = gT)
+t3W     = input.int(1, "Divider width", minval = 1, maxval = 4, inline = "t1", group = gT)
+t3St    = input.string("Dotted", "Style", options = ["Solid","Dashed","Dotted"], inline = "t1", group = gT)
+t3Fill  = input.bool(true, "Shade the bands", inline = "t2", group = gT)
+t3Op    = input.int(85, "Shade opacity", minval = 60, maxval = 99, inline = "t2", group = gT)
+t3Ext   = input.int(25, "Extend right (bars)", minval = 0, maxval = 200, group = gT)
+t3Box   = input.bool(false, "Also draw a solid box around the leg (the thirds already outline it)", group = gT,
+     tooltip = "The leg range is the unit. One box: based at the deepest retracement point since the prior HH, topped at the current highest HH. The base is set RETROACTIVELY when the new HH prints, because until then every interior low is inner structure, not an OS HL.")
+t3BoxC  = input.color(#787b86, "Box border", inline = "tb", group = gT)
+t3BoxF  = input.int(96, "Box fill opacity", minval = 70, maxval = 100, inline = "tb", group = gT)
+t3Dbg   = input.bool(true, "DIAGNOSTIC panel (turn off once it works)", group = gT)
+t3Pot   = input.bool(true, "Mark the potential HL / LH", group = gT,
+     tooltip = "The DEEPEST POINT OF THE RETRACEMENT since the current HH - the furthest price has pulled back while still holding above the confirmed HL. It is the candidate that becomes the official OS HL when a new HH prints. Not the most recent pivot low, and not a lower low.")
+t3PotC  = input.color(#ffffff, "Potential level colour", group = gT)
+t3Guard = input.bool(true, "Draw the invalidation level (the HL/LH that must be closed through)", group = gT)
+t3GCol  = input.color(#ff9800, "Invalidation colour", group = gT)
+
+gF = "④ Text"
+fFam    = input.string("Default", "Font", options = ["Default","Monospace"], group = gF)
+fTxt    = input.color(color.black, "Label text colour", group = gF)
+fPriceC = input.color(#787b86, "Price tag colour", group = gF)
+dbg     = input.bool(false, "Show readout (debug)", group = gF)
+
+// ══════════════════════════════════════════════════════════════════
+// HELPERS  (top level only)
+// ══════════════════════════════════════════════════════════════════
+f_lx(int b) => math.max(nz(b, bar_index), bar_index - 4000)
+f_style(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+f_size(string s)  => s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Large" ? size.large : s == "Huge" ? size.huge : size.normal
+f_font()          => fFam == "Monospace" ? font.family_monospace : font.family_default
+f_vis(bool isOuter) => isOuter ? (oOn and kOuterOn) : (iOn and kInnerOn)
+atr = ta.atr(20)
+
+// ══════════════════════════════════════════════════════════════════
+// ZIGZAG
+// ══════════════════════════════════════════════════════════════════
+type ZZ
+    float[] px
+    int[]   bx
+    bool[]  isHi
+    int     dir
+    line    leg
+    label   tag
+
+f_new() => ZZ.new(array.new_float(), array.new_int(), array.new_bool(), 0, na, na)
+
+f_step(ZZ z, int prd, bool draw, color cu, color cd, int w, string st,
+       bool showLbl, string lsz, float off) =>
+    ph = ta.highestbars(high, prd) == 0 ? high : na
+    pl = ta.lowestbars(low,  prd) == 0 ? low  : na
+    nd = not na(ph) and na(pl) ? 1 : not na(pl) and na(ph) ? -1 : z.dir
+    changed = nd != z.dir
+    z.dir := nd
+    added = false
+    if not na(ph) or not na(pl)
+        v = z.dir == 1 ? ph : pl
+        if changed or z.px.size() == 0
+            z.px.unshift(v)
+            z.bx.unshift(bar_index)
+            z.isHi.unshift(z.dir == 1)
+            if z.px.size() > 20
+                z.px.pop()
+                z.bx.pop()
+                z.isHi.pop()
+            added := true
+        else if (z.dir == 1 and v > z.px.get(0)) or (z.dir == -1 and v < z.px.get(0))
+            z.px.set(0, v)
+            z.bx.set(0, bar_index)
+    if z.px.size() >= 3 and draw
+        if not added
+            line.delete(z.leg)
+            label.delete(z.tag)
+        col = z.dir == 1 ? cu : cd
+        z.leg := line.new(f_lx(z.bx.get(1)), z.px.get(1), z.bx.get(0), z.px.get(0),
+             color = col, width = w, style = f_style(st))
+        if showLbl
+            hh  = z.isHi.get(0)
+            txt = hh ? (z.px.get(0) > z.px.get(2) ? "HH" : "LH") : (z.px.get(0) < z.px.get(2) ? "LL" : "HL")
+            tc  = hh ? (z.px.get(0) > z.px.get(2) ? cu : cd) : (z.px.get(0) < z.px.get(2) ? cd : cu)
+            ypx = z.px.get(0) + (hh ? 1 : -1) * off * nz(atr, 0)
+            z.tag := label.new(z.bx.get(0), ypx, txt, color = tc, textcolor = fTxt,
+                 size = f_size(lsz), style = hh ? label.style_label_down : label.style_label_up,
+                 text_font_family = f_font())
+    added
+
+// bullish pivot = higher than the previous same-type pivot  (HH or HL)
+f_isBull(ZZ z, int k) =>
+    bool r = true
+    if k + 2 <= z.px.size() - 1
+        r := z.px.get(k) > z.px.get(k + 2)
+    r
+
+// STATEFUL TREND.  His rule, and it is the right one: an uptrend is alive until price
+// CLOSES BELOW THE HL.  A lower high with a higher low is price coiling inside a trend,
+// not the end of one, so a pivot-comparison rule that demands HH+HL every bar is wrong.
+// The guard trails: each new completed low in a bull trend raises the invalidation level.
+f_lastPivot(ZZ z, bool wantHigh) =>
+    float v = na
+    if z.px.size() >= 2
+        for k = 1 to z.px.size() - 1
+            if z.isHi.get(k) == wantHigh
+                v := z.px.get(k)
+                break
+    v
+
+// structural bias from COMPLETED pivots only.  Index 0 is the LIVE pivot still forming,
+// so a potential LH appearing there must NOT flip the trend off - the retracement has not
+// broken anything yet.  Everything below starts at index 1.
+f_bias(ZZ z) =>
+    int b = 0
+    if z.px.size() >= 5
+        bool topFirst = z.isHi.get(1)
+        int h = topFirst ? 1 : 2
+        int l = topFirst ? 2 : 1
+        if h + 2 <= z.px.size() - 1 and l + 2 <= z.px.size() - 1
+            bool hh = z.px.get(h) > z.px.get(h + 2)
+            bool hl = z.px.get(l) > z.px.get(l + 2)
+            b := hh and hl ? 1 : (not hh and not hl ? -1 : 0)
+    b
+
+// the most recent COMPLETED impulse leg, skipping the live pivot.
+// returns [anchor, origin, startBar] or na if there isn't one yet.
+f_leg(ZZ z, int dir) =>
+    float an = na
+    float og = na
+    int   b0 = na
+    if z.px.size() >= 3
+        for k = 1 to z.px.size() - 2
+            bool wantHigh = dir == 1
+            if z.isHi.get(k) == wantHigh and z.isHi.get(k + 1) != wantHigh
+                an := z.px.get(k)
+                og := z.px.get(k + 1)
+                b0 := math.min(z.bx.get(k), z.bx.get(k + 1))
+                break
+    [an, og, b0]
+
+f_guard(ZZ z, bool bull) =>
+    float g = na
+    if z.px.size() >= 2
+        bool topFirst = z.isHi.get(0)
+        g := bull ? z.px.get(topFirst ? 1 : 0) : z.px.get(topFirst ? 0 : 1)
+    g
+
+var ZZ outer = f_new()
+var ZZ inner = f_new()
+oAdded = f_step(outer, oPrd, oOn, oUp, oDn, oW, oStyle, oLbl, oLblSz, oOff)
+iAdded = f_step(inner, iPrd, iOn, iUp, iDn, iW, iStyle, iLbl, iLblSz, iOff)
+
+// ══════════════════════════════════════════════════════════════════
+// LEVELS
+// ══════════════════════════════════════════════════════════════════
+type Lvl
+    line  ln
+    label tg
+    float px
+    bool  isHi
+    bool  isOuter
+    bool  bull
+    int   state
+    int   born
+
+var Lvl[] lv = array.new<Lvl>()
+
+f_col(bool isOuter, bool bull, int state) =>
+    base = isOuter ? (bull ? kOBull : kOBear) : (bull ? kIBull : kIBear)
+    t = not f_vis(isOuter) ? 100 : state == 0 ? tUntest : state == 1 ? tTested : tBroken
+    color.new(base, t)
+
+f_lstyle(bool isOuter, int state) =>
+    state == 2 and ovBroken ? f_style(stBroken) : f_style(isOuter ? kOSt : kISt)
+
+f_add(bool isOuter, float px, int bx, bool isHi, bool bull) =>
+    L = Lvl.new(na, na, px, isHi, isOuter, bull, 0, bar_index)
+    L.ln := line.new(f_lx(bx), px, bar_index + kExt, px, color = f_col(isOuter, bull, 0),
+         width = isOuter ? kOW : kIW, style = f_lstyle(isOuter, 0))
+    if kPrice
+        L.tg := label.new(bar_index + kExt, px, str.tostring(px, format.mintick),
+             color = #00000000, textcolor = f_vis(isOuter) ? fPriceC : #00000000,
+             size = size.tiny, style = label.style_label_left, text_font_family = f_font())
+    lv.push(L)
+
+// levels are created from the pivot that just completed (index 1).
+// creation still happens while hidden, so nothing is lost when you re-tick the box.
+if oAdded and outer.px.size() >= 3
+    f_add(true, outer.px.get(1), outer.bx.get(1), outer.isHi.get(1), f_isBull(outer, 1))
+if iAdded and inner.px.size() >= 3
+    f_add(false, inner.px.get(1), inner.bx.get(1), inner.isHi.get(1), f_isBull(inner, 1))
+
+if lv.size() > 0
+    for k = lv.size() - 1 to 0
+        L = lv.get(k)
+        guard = f_guard(L.isOuter ? outer : inner, L.bull)
+        bool dead = false
+        if kMode == "Persist until structure breaks"
+            if not na(guard)
+                dead := L.bull ? close < guard : close > guard
+        else
+            int same = 0
+            for j = lv.size() - 1 to k
+                M = lv.get(j)
+                if M.isOuter == L.isOuter and M.isHi == L.isHi
+                    same += 1
+            dead := same > kRecent
+        if dead
+            line.delete(L.ln)
+            label.delete(L.tg)
+            lv.remove(k)
+        else
+            if bar_index > L.born
+                if L.state < 2 and ((L.isHi and close > L.px) or (not L.isHi and close < L.px))
+                    L.state := 2
+                else if L.state == 0 and high >= L.px and low <= L.px
+                    L.state := 1
+            L.ln.set_x2(bar_index + kExt)
+            L.ln.set_color(f_col(L.isOuter, L.bull, L.state))
+            L.ln.set_style(f_lstyle(L.isOuter, L.state))
+            if kPrice and not na(L.tg)
+                L.tg.set_x(bar_index + kExt)
+                L.tg.set_textcolor(f_vis(L.isOuter) ? fPriceC : #00000000)
+
+if lv.size() > kMax * 2
+    Lo = lv.shift()
+    line.delete(Lo.ln)
+    label.delete(Lo.tg)
+
+// ══════════════════════════════════════════════════════════════════
+// DEBUG
+// ══════════════════════════════════════════════════════════════════
+var label dbgl = na
+if dbg and barstate.islast
+    label.delete(dbgl)
+    int ob = 0
+    int bb = 0
+    if lv.size() > 0
+        for k = 0 to lv.size() - 1
+            M = lv.get(k)
+            ob += M.isOuter ? 1 : 0
+            bb += M.bull ? 1 : 0
+    dbgl := label.new(bar_index, high,
+         "levels " + str.tostring(lv.size()) + "  (outer " + str.tostring(ob) + ")\n" +
+         "bullish " + str.tostring(bb) + " · bearish " + str.tostring(lv.size() - bb) + "\n" +
+         "piv o/i " + str.tostring(outer.px.size()) + "/" + str.tostring(inner.px.size()),
+         color = #00000080, textcolor = color.white, size = size.small,
+         style = label.style_label_down, text_font_family = font.family_monospace)
+
+// ══════════════════════════════════════════════════════════════════
+// BIG BARS — range vs the recent average.  big bar => take leg 1 only, no adds.
+// ══════════════════════════════════════════════════════════════════
+barRange = high - low
+// the average is optionally built from RTH bars only and carried forward across globex,
+// so the threshold does not shrink overnight
+isRTHbar = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+var float rthAvg = na
+rthSma   = ta.sma(isRTHbar ? barRange : na, bbLen)
+if isRTHbar and not na(rthSma)
+    rthAvg := rthSma
+avgAll   = ta.sma(barRange, bbLen)
+avgRange = bbRTH ? nz(rthAvg, avgAll) : avgAll
+bbX      = avgRange > 0 ? barRange / avgRange : na
+isBig    = bbOn and not na(bbX) and bbX >= bbMult and barRange >= bbFloor
+isBigBull= isBig and close >= open
+isBigBear= isBig and close <  open
+bbCol    = isBigBull ? bbBull : isBigBear ? bbBear : na
+
+barcolor(bbBody and not na(bbCol) ? bbCol : na, title = "Big bar body")
+plotcandle(bbWick and not na(bbCol) ? open  : na, bbWick and not na(bbCol) ? high : na,
+           bbWick and not na(bbCol) ? low   : na, bbWick and not na(bbCol) ? close : na,
+           title = "Big bar wick", color = bbCol, wickcolor = bbCol,
+           bordercolor = bbBord ? bbCol : na)
+
+var label bbLbl = na
+if bbRead and barstate.islast and not na(bbX)
+    label.delete(bbLbl)
+    bbLbl := label.new(bar_index, low,
+         str.tostring(bbX, "#.00") + "x  " + str.tostring(barRange, "#") + " pts",
+         color = #00000000, textcolor = bbTxt, size = size.small,
+         style = label.style_label_up, text_font_family = f_font())
+
+alertcondition(isBig, "Big bar", "Big bar — take leg 1 only, no adds")
+
+// ══════════════════════════════════════════════════════════════════
+// BROADENING FORMATION + FADE ARROW
+// upper line through the last two highs (must be ascending)
+// lower line through the last two lows (must be descending)
+// ══════════════════════════════════════════════════════════════════
+// HIS RULE: connect HH to HH, and LL to LL.  Not "the last two highs".
+// A pivot is an HH only if it exceeds the high BEFORE it (index k vs k+2, since the
+// zigzag alternates).  Highs of 100, 90, 95 give an ascending pair 90->95 even though
+// 95 is a lower high against the 100 - that pair is not an HH-to-HH line.
+// Pure to one zigzag: outer anchors on outer pivots, inner on inner. Never mixed.
+// Connect the last two SAME-LABELLED pivots on a side.
+//   highs: HH->HH  or  LH->LH
+//   lows:  LL->LL  or  HL->HL
+// Requiring LL->LL for the lower line was too strict - in an uptrend the lows are HLs,
+// so no pair existed and nothing drew. Two lines should always exist when structure does,
+// and whether they diverge, converge or run parallel is the information.
+// HIS RULE: connect the last two HHs (upper) and the last two LLs (lower).
+// Search past any LH or HL sitting in between - do NOT match whatever label the newest
+// pivot happens to carry. That older behaviour returned HL->HL for the lower line
+// (slope +1.53, ascending) and LH->LH for the inner upper (slope -2.79, descending),
+// which the direction test then rejected, so those lines never drew.
+//   upper wants HH:  px[k] >  px[k+2]
+//   lower wants LL:  px[k] <  px[k+2]
+f_pick(ZZ z, bool wantHigh) =>
+    float p1 = na
+    float p2 = na
+    int   b1 = na
+    int   b2 = na
+    int   found = 0
+    if z.px.size() >= 3
+        for k = 0 to z.px.size() - 3
+            if found < 2 and z.isHi.get(k) == wantHigh
+                bool isTarget = wantHigh ? z.px.get(k) > z.px.get(k + 2) : z.px.get(k) < z.px.get(k + 2)
+                if isTarget
+                    if found == 0
+                        p1 := z.px.get(k)
+                        b1 := z.bx.get(k)
+                    else
+                        p2 := z.px.get(k)
+                        b2 := z.bx.get(k)
+                    found += 1
+    [p1, b1, p2, b2]
+
+var line bfOUp = na
+var line bfODn = na
+var line bfIUp = na
+var line bfIDn = na
+
+[oh1, ohb1, oh2, ohb2] = f_pick(outer, true)
+[ol1, olb1, ol2, olb2] = f_pick(outer, false)
+[ih1, ihb1, ih2, ihb2] = f_pick(inner, true)
+[il1, ilb1, il2, ilb2] = f_pick(inner, false)
+
+// PERSIST THE ANCHORS. A line stays alive until a NEW qualifying pair replaces it -
+// these levels often matter for days, and redrawing only from the current pair meant a
+// line vanished the moment the newest pivots stopped qualifying. The fade arrows print
+// historically, so an arrow could sit on the chart with no line anywhere near it.
+var float sOh1 = na
+var float sOh2 = na
+var int   sOhb1 = na
+var int   sOhb2 = na
+var float sOl1 = na
+var float sOl2 = na
+var int   sOlb1 = na
+var int   sOlb2 = na
+var float sIh1 = na
+var float sIh2 = na
+var int   sIhb1 = na
+var int   sIhb2 = na
+var float sIl1 = na
+var float sIl2 = na
+var int   sIlb1 = na
+var int   sIlb2 = na
+
+// A persisted pair must still exist inside the zigzag's current window. Without this,
+// anchors written months ago survive forever and the lines (and the diagnostic) report a
+// formation that scrolled off the structure long ago.
+oOldest = outer.bx.size() > 0 ? outer.bx.get(outer.bx.size() - 1) : na
+iOldest = inner.bx.size() > 0 ? inner.bx.get(inner.bx.size() - 1) : na
+if not na(sOhb2) and not na(oOldest) and sOhb2 < oOldest
+    sOh1 := na
+    sOh2 := na
+    sOhb1 := na
+    sOhb2 := na
+if not na(sOlb2) and not na(oOldest) and sOlb2 < oOldest
+    sOl1 := na
+    sOl2 := na
+    sOlb1 := na
+    sOlb2 := na
+if not na(sIhb2) and not na(iOldest) and sIhb2 < iOldest
+    sIh1 := na
+    sIh2 := na
+    sIhb1 := na
+    sIhb2 := na
+if not na(sIlb2) and not na(iOldest) and sIlb2 < iOldest
+    sIl1 := na
+    sIl2 := na
+    sIlb1 := na
+    sIlb2 := na
+
+if not na(oh1) and not na(oh2) and ohb1 != ohb2
+    sOh1 := oh1
+    sOh2 := oh2
+    sOhb1 := ohb1
+    sOhb2 := ohb2
+if not na(ol1) and not na(ol2) and olb1 != olb2
+    sOl1 := ol1
+    sOl2 := ol2
+    sOlb1 := olb1
+    sOlb2 := olb2
+if not na(ih1) and not na(ih2) and ihb1 != ihb2
+    sIh1 := ih1
+    sIh2 := ih2
+    sIhb1 := ihb1
+    sIhb2 := ihb2
+if not na(il1) and not na(il2) and ilb1 != ilb2
+    sIl1 := il1
+    sIl2 := il2
+    sIlb1 := ilb1
+    sIlb2 := ilb2
+
+oUsl = not na(sOh1) and sOhb1 != sOhb2 ? (sOh1 - sOh2) / (sOhb1 - sOhb2) : na
+oLsl = not na(sOl1) and sOlb1 != sOlb2 ? (sOl1 - sOl2) / (sOlb1 - sOlb2) : na
+iUsl = not na(sIh1) and sIhb1 != sIhb2 ? (sIh1 - sIh2) / (sIhb1 - sIhb2) : na
+iLsl = not na(sIl1) and sIlb1 != sIlb2 ? (sIl1 - sIl2) / (sIlb1 - sIlb2) : na
+
+oUpNow = na(oUsl) ? na : sOh1 + oUsl * (bar_index - sOhb1)
+oDnNow = na(oLsl) ? na : sOl1 + oLsl * (bar_index - sOlb1)
+iUpNow = na(iUsl) ? na : sIh1 + iUsl * (bar_index - sIhb1)
+iDnNow = na(iLsl) ? na : sIl1 + iLsl * (bar_index - sIlb1)
+
+bool bfAny  = bfShape == "Any same-label pair"
+bool bfBoth = bfShape == "Both required"
+// per-line direction test: a broadening upper line ASCENDS, a broadening lower DESCENDS
+bool oUpDir = bfAny or (not na(oUsl) and oUsl > 0)
+bool oDnDir = bfAny or (not na(oLsl) and oLsl < 0)
+bool iUpDir = bfAny or (not na(iUsl) and iUsl > 0)
+bool iDnDir = bfAny or (not na(iLsl) and iLsl < 0)
+// "Both required" additionally insists the other side qualifies too
+bool oShape = oUpDir and (not bfBoth or oDnDir)
+bool oShapeD = oDnDir and (not bfBoth or oUpDir)
+bool iShape = iUpDir and (not bfBoth or iDnDir)
+bool iShapeD = iDnDir and (not bfBoth or iUpDir)
+bool bfUpOK  = bfOn and bfOuter and oShape and not na(oUsl) and math.abs(sOhb1 - sOhb2) >= bfMinSep
+bool bfDnOK  = bfOn and bfOuter and oShapeD and not na(oLsl) and math.abs(sOlb1 - sOlb2) >= bfMinSep
+bool bfIUpOK = bfOn and bfInner and iShape and not na(iUsl) and math.abs(sIhb1 - sIhb2) >= bfMinSepI
+bool bfIDnOK = bfOn and bfInner and iShapeD and not na(iLsl) and math.abs(sIlb1 - sIlb2) >= bfMinSepI
+bool bfWide  = not na(oUpNow) and not na(oDnNow) and (oUpNow - oDnNow >= bfMinW * nz(atr, 0))
+upNow = oUpNow
+dnNow = oDnNow
+
+// A CONVERGING pair crosses if projected far enough, and past the apex the upper line
+// sits BELOW the lower one - which reads as the lines being inverted. Stop each pair at
+// its own intersection so that can never happen.
+f_apex(float p1a, int b1a, float sa, float p1b, int b1b, float sb, int fallback) =>
+    int x = fallback
+    if not na(sa) and not na(sb) and sa != sb
+        float ia = p1a - sa * b1a
+        float ib = p1b - sb * b1b
+        float xi = (ib - ia) / (sa - sb)
+        if xi > bar_index and xi < fallback
+            x := int(xi)
+    x
+
+// cap the forward projection to the span the slope was measured over
+f_end(int b1a, int b2a, int b1b, int b2b, int apex) =>
+    int sp = math.max(math.abs(b1a - b2a), math.abs(b1b - b2b))
+    int cap = bfSpan ? math.min(bar_index + sp, apex) : apex
+    math.max(cap, bar_index + 1)
+
+oApex = f_apex(sOh1, sOhb1, oUsl, sOl1, sOlb1, oLsl, bar_index + bfExt)
+iApex = f_apex(sIh1, sIhb1, iUsl, sIl1, sIlb1, iLsl, bar_index + bfExt)
+oEnd  = f_end(sOhb1, sOhb2, sOlb1, sOlb2, oApex)
+iEnd  = f_end(sIhb1, sIhb2, sIlb1, sIlb2, iApex)
+
+if barstate.islast
+    line.delete(bfOUp), line.delete(bfODn), line.delete(bfIUp), line.delete(bfIDn)
+    if bfUpOK
+        bfOUp := line.new(f_lx(sOhb2), sOh2, oEnd, sOh1 + oUsl * (oEnd - sOhb1),
+             color = bfOU, width = bfW, style = f_style(bfSt))
+    if bfDnOK
+        bfODn := line.new(f_lx(sOlb2), sOl2, oEnd, sOl1 + oLsl * (oEnd - sOlb1),
+             color = bfOD, width = bfW, style = f_style(bfSt))
+    if bfIUpOK
+        bfIUp := line.new(f_lx(sIhb2), sIh2, iEnd, sIh1 + iUsl * (iEnd - sIhb1),
+             color = bfIU, width = bfW, style = f_style(bfSt))
+    if bfIDnOK
+        bfIDn := line.new(f_lx(sIlb2), sIl2, iEnd, sIl1 + iLsl * (iEnd - sIlb1),
+             color = bfID, width = bfW, style = f_style(bfSt))
+
+// ── BF DIAGNOSTIC: every gate for all four lines, so nothing has to be guessed ──
+var table bfT = table.new(position.middle_right, 4, 6, border_width = 1)
+if bfDiag and barstate.islast
+    table.cell(bfT, 0, 0, "BF",     text_color = color.white,  text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 1, 0, "slope",  text_color = color.white,  text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 2, 0, "age",    text_color = color.white,  text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 3, 0, "draws?", text_color = color.white,  text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 0, 1, "OS up",  text_color = bfOU, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 1, 1, na(oUsl) ? "na" : str.tostring(oUsl, "#.00"), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 2, 1, na(sOhb1) ? "na" : str.tostring(bar_index - sOhb1), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 3, 1, bfUpOK ? "YES" : "no", text_color = bfUpOK ? color.lime : color.red, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 0, 2, "OS dn",  text_color = bfOD, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 1, 2, na(oLsl) ? "na" : str.tostring(oLsl, "#.00"), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 2, 2, na(sOlb1) ? "na" : str.tostring(bar_index - sOlb1), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 3, 2, bfDnOK ? "YES" : "no", text_color = bfDnOK ? color.lime : color.red, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 0, 3, "IS up",  text_color = bfIU, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 1, 3, na(iUsl) ? "na" : str.tostring(iUsl, "#.00"), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 2, 3, na(sIhb1) ? "na" : str.tostring(bar_index - sIhb1), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 3, 3, bfIUpOK ? "YES" : "no", text_color = bfIUpOK ? color.lime : color.red, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 0, 4, "IS dn",  text_color = bfID, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 1, 4, na(iLsl) ? "na" : str.tostring(iLsl, "#.00"), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 2, 4, na(sIlb1) ? "na" : str.tostring(bar_index - sIlb1), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 3, 4, bfIDnOK ? "YES" : "no", text_color = bfIDnOK ? color.lime : color.red, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 0, 5, "ends",   text_color = color.white, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 1, 5, "OS " + str.tostring(oEnd - bar_index), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 2, 5, "IS " + str.tostring(iEnd - bar_index), text_color = color.yellow, text_size = size.small, bgcolor = #000000AA)
+    table.cell(bfT, 3, 5, "bars fwd", text_color = color.white, text_size = size.small, bgcolor = #000000AA)
+
+rngB   = math.max(high - low, syminfo.mintick)
+locB   = (close - low) / rngB
+fadeLong  = bfDnOK and fdOn   and low  <= dnNow and close >= dnNow and (not fdReq or locB >= 0.65)
+fadeShort = bfUpOK and fdUpOn and high >= upNow and close <= upNow and (not fdReq or locB <= 0.35)
+
+// arrows are placed with location.absolute so the offset can clear the pivot labels
+sameBarLo = (iOn and iLbl and iAdded and not inner.isHi.get(0)) or (oOn and oLbl and oAdded and not outer.isHi.get(0))
+sameBarHi = (iOn and iLbl and iAdded and inner.isHi.get(0)) or (oOn and oLbl and oAdded and outer.isHi.get(0))
+extraLo   = fdAuto and sameBarLo ? math.max(oOff, iOff) + 1.0 : 0.0
+extraHi   = fdAuto and sameBarHi ? math.max(oOff, iOff) + 1.0 : 0.0
+aLong  = fadeLong  ? low  - (fdOff + extraLo) * nz(atr, 0) : na
+aShort = fadeShort ? high + (fdOff + extraHi) * nz(atr, 0) : na
+
+// plotshape needs a CONST size, and an input never qualifies as const,
+// so there is one call per size and the setting gates which one fires.
+plotshape(fdSz == "Tiny"   ? aLong : na, title = "Fade long tiny",   style = shape.triangleup,   location = location.absolute, color = fdBull, size = size.tiny)
+plotshape(fdSz == "Small"  ? aLong : na, title = "Fade long small",  style = shape.triangleup,   location = location.absolute, color = fdBull, size = size.small)
+plotshape(fdSz == "Normal" ? aLong : na, title = "Fade long normal", style = shape.triangleup,   location = location.absolute, color = fdBull, size = size.normal)
+plotshape(fdSz == "Large"  ? aLong : na, title = "Fade long large",  style = shape.triangleup,   location = location.absolute, color = fdBull, size = size.large)
+plotshape(fdSz == "Tiny"   ? aShort : na, title = "Fade short tiny",   style = shape.triangledown, location = location.absolute, color = fdBear, size = size.tiny)
+plotshape(fdSz == "Small"  ? aShort : na, title = "Fade short small",  style = shape.triangledown, location = location.absolute, color = fdBear, size = size.small)
+plotshape(fdSz == "Normal" ? aShort : na, title = "Fade short normal", style = shape.triangledown, location = location.absolute, color = fdBear, size = size.normal)
+plotshape(fdSz == "Large"  ? aShort : na, title = "Fade short large",  style = shape.triangledown, location = location.absolute, color = fdBear, size = size.large)
+
+// diagnostic: say WHY the formation is not drawn, so an absent line is never mistaken for a bug
+var label bfMsg = na
+if bfDiag and barstate.islast
+    label.delete(bfMsg)
+    string why = na
+    if not bfOn
+        why := "BF off"
+    else if na(oUsl) and na(oLsl)
+        why := "BF: not enough outer pivots yet"
+    else if na(oUsl)
+        why := "BF: no outer upper line"
+    else if na(oLsl)
+        why := "BF: no outer lower line"
+    else if not oShape and not oShapeD
+        why := "BF: outer highs not ascending and lows not descending"
+    else if not oShape
+        why := "BF: no outer upper - highs are not ascending"
+    else if not oShapeD
+        why := "BF: no outer lower - lows are not descending (normal in an uptrend)"
+    if not na(why)
+        bfMsg := label.new(bar_index + 3, high, why, color = #00000000, textcolor = bfOU,
+             size = size.small, style = label.style_label_left, text_font_family = f_font())
+
+alertcondition(fadeLong,  "BF fade long",  "Touched the lower broadening line and closed back up")
+alertcondition(fadeShort, "BF fade short", "Touched the upper broadening line and closed back down")
+
+
+// ══════════════════════════════════════════════════════════════════
+// THE OS BOX — recomputed from the pivot window every bar, never ratcheted.
+// The previous version kept a running maximum, so once price printed a high it froze
+// there forever and every later structure was measured against a dead level.
+//   top  = the highest completed high pivot inside the window (lowest low for a bear)
+//   base = the pivot immediately before it in time - the confirmed HL
+// ══════════════════════════════════════════════════════════════════
+// the most recent completed pivot of a given side, with its bar
+f_lastPivotBar(ZZ z, bool wantHigh) =>
+    float v = na
+    int   b = na
+    if z.px.size() >= 1
+        for k = 0 to z.px.size() - 1
+            if z.isHi.get(k) == wantHigh
+                v := z.px.get(k)
+                b := z.bx.get(k)
+                break
+    [v, b]
+
+f_box(ZZ z, int dir, int depth) =>
+    float top = na
+    float base = na
+    int   topBar = na
+    int   baseBar = na
+    int   prevBar = na
+    if z.px.size() >= 3
+        int best = -1
+        int lim = math.min(z.px.size() - 2, depth)
+        for k = 1 to lim
+            if z.isHi.get(k) == (dir == 1)
+                if best == -1
+                    best := k
+                else if (dir == 1 and z.px.get(k) > z.px.get(best)) or (dir == -1 and z.px.get(k) < z.px.get(best))
+                    best := k
+        if best >= 0 and best + 1 <= z.px.size() - 1
+            if z.isHi.get(best + 1) != (dir == 1)
+                top     := z.px.get(best)
+                topBar  := z.bx.get(best)
+                base    := z.px.get(best + 1)
+                baseBar := z.bx.get(best + 1)
+                // the previous same-side pivot starts the span the OS level lives in
+                if best + 2 <= z.px.size() - 1
+                    prevBar := z.bx.get(best + 2)
+    [top, topBar, base, baseBar, prevBar]
+
+zOS = t3Src == "Outer" ? outer : inner
+biasOS = f_bias(zOS)
+dirOS  = biasOS != 0 ? biasOS : 1
+[bxTop, bxTopBar, bxBaseP, bxBasePBar, bxPrevHi] = f_box(zOS, dirOS, t3Depth)
+[bxBot, bxBotBar, bxCapP, bxCapPBar, bxPrevLo] = f_box(zOS, -1, t3Depth)
+
+// OS LEVELS.
+//   REFERENCE HH  = the last CONFIRMED outer high pivot (bxTop).  It does NOT ratchet with
+//                   every new high - letting it do that made the takeout retrigger on every
+//                   bar of a rally and lock a fresh shallow low each time.
+//   P-HL          = deepest low since that pivot's bar.  A lookback, so it cannot drift.
+//   CONVERSION    = fires ONCE per anchor, the first time price closes above the reference
+//                   HH.  After that it waits for the zigzag to confirm a new pivot.
+lbLo      = na(bxTopBar) ? 1 : math.min(math.max(bar_index - bxTopBar, 1), 2000)
+pendLo    = na(bxTopBar) or bar_index <= bxTopBar ? na : ta.lowest(low, math.max(lbLo, 1))
+pendLoBar = na(bxTopBar) or bar_index <= bxTopBar ? na : bar_index + ta.lowestbars(low, math.max(lbLo, 1))
+
+var float osHL       = na
+var int   osHLBar    = na
+var int   convertedAt = na
+if not na(bxTop) and not na(bxTopBar) and not na(pendLo)
+    if close > bxTop and (na(convertedAt) or convertedAt != bxTopBar)
+        osHL        := pendLo
+        osHLBar     := pendLoBar
+        convertedAt := bxTopBar
+
+// nothing confirmed yet: fall back to the pivot the zigzag offers
+bxBase    = na(osHL) ? bxBaseP : osHL
+bxBaseBar = na(osHL) ? bxBasePBar : osHLBar
+runLo     = pendLo
+runLoBar  = pendLoBar
+
+// bear mirror
+lbHi      = na(bxBotBar) ? 1 : math.min(math.max(bar_index - bxBotBar, 1), 2000)
+pendHi    = na(bxBotBar) or bar_index <= bxBotBar ? na : ta.highest(high, math.max(lbHi, 1))
+pendHiBar = na(bxBotBar) or bar_index <= bxBotBar ? na : bar_index + ta.highestbars(high, math.max(lbHi, 1))
+var float osLH       = na
+var int   osLHBar    = na
+var int   convertedAtB = na
+if not na(bxBot) and not na(bxBotBar) and not na(pendHi)
+    if close < bxBot and (na(convertedAtB) or convertedAtB != bxBotBar)
+        osLH         := pendHi
+        osLHBar      := pendHiBar
+        convertedAtB := bxBotBar
+bxCap     = na(osLH) ? bxCapP : osLH
+bxCapBar  = na(osLH) ? bxCapPBar : osLHBar
+runHi     = pendHi
+runHiBar  = pendHiBar
+
+// ── strict OS labelling: an interior low is not an HL until a new HH confirms it ──
+// The zigzag labels pairwise, so it calls the live pullback low an HL. Per his rule the
+// only OS HL is the one that produced the current HH; everything else is interior.
+if oStrict and oOn and oLbl and not na(outer.tag)
+    lbTxt = label.get_text(outer.tag)
+    lbY   = outer.px.get(0)
+    bool keep = true
+    if lbTxt == "HL"
+        keep := not na(bxBase) and math.abs(lbY - bxBase) < syminfo.mintick
+    if lbTxt == "LH"
+        keep := not na(bxCap) and math.abs(lbY - bxCap) < syminfo.mintick
+    if not keep
+        label.delete(outer.tag)
+
+// ── stateful trend for the OUTER and INNER zigzags ──
+f_state(ZZ z, int prev, float confBase, float confCap) =>
+    int st = prev
+    int fresh = f_bias(z)
+    if fresh != 0
+        st := fresh
+    // invalidation is the CONFIRMED OS level (the box base / cap), never a newer interior low.
+    // A dip through a minor low is inner structure; only a close through the confirmed
+    // HL/LH ends the trend.
+    if st == 1 and not na(confBase) and close < confBase
+        st := 0
+    if st == -1 and not na(confCap) and close > confCap
+        st := 0
+    st
+
+var int   oState = 0
+var float oGuard = na
+var int   iState = 0
+var float iGuard = na
+oState := f_state(zOS, oState, bxBase, bxCap)
+iState := oState
+oGuard := bxBase
+iGuard := bxCap
+
+// exactly ONE confirmed OS label, redrawn each bar at the confirmed level
+var label osLbl = na
+if barstate.islast
+    label.delete(osLbl)
+    if oStrict and oOn and oLbl and oState != 0
+        float cv = oState == 1 ? bxBase : bxCap
+        int   cb = oState == 1 ? bxBaseBar : bxCapBar
+        if not na(cv) and not na(cb)
+            osLbl := label.new(cb, cv, oState == 1 ? "HL" : "LH",
+                 color = oState == 1 ? oUp : oDn, textcolor = fTxt, size = f_size(oLblSz),
+                 style = oState == 1 ? label.style_label_up : label.style_label_down,
+                 text_font_family = f_font())
+
+
+
+
+var box osBox = na
+if barstate.islast
+    box.delete(osBox)
+    stB = t3Src == "Outer" ? oState : iState
+    float bTop = stB == 1 ? math.max(nz(bxTop, high), ta.highest(high, math.max(lbLo, 1))) : bxCap
+    float bBot = stB == 1 ? bxBase : bxBot
+    int   bLeft = stB == 1 ? math.min(nz(bxTopBar, bar_index), nz(bxBaseBar, bar_index)) : math.min(nz(bxBotBar, bar_index), nz(bxCapBar, bar_index))
+    if t3On and t3Box and stB != 0 and not na(bTop) and not na(bBot) and bTop > bBot
+        osBox := box.new(f_lx(bLeft), bTop, bar_index + t3Ext, bBot,
+             border_color = t3BoxC, border_width = 1, bgcolor = color.new(t3BoxC, t3BoxF))
+
+// ══════════════════════════════════════════════════════════════════
+// LEG THIRDS — N3 / M3 / F3 on the current OUTER leg, trending states only.
+// The leg is the last two COMPLETED pivots: index 1 is the anchor, index 2 the origin.
+// Index 0 is the live pivot forming as price retraces and is deliberately not used.
+// ══════════════════════════════════════════════════════════════════
+var line   t3a = na
+var line   t3b = na
+var line   t3c = na
+var line   t3d = na
+var linefill t3f1 = na
+var linefill t3f2 = na
+var linefill t3f3 = na
+
+if barstate.islast
+    line.delete(t3a), line.delete(t3b), line.delete(t3c), line.delete(t3d)
+    zT = t3Src == "Outer" ? outer : inner
+    bT = t3Src == "Outer" ? oState : iState
+    if t3On and bT != 0 and zT.px.size() >= 3
+        float anchor = bT == 1 ? math.max(nz(bxTop, high), ta.highest(high, math.max(lbLo, 1)))  : bxBot
+        float origin = bT == 1 ? bxBase : bxCap
+        int   b0     = bT == 1 ? math.min(nz(bxTopBar, bar_index), nz(bxBaseBar, bar_index)) : math.min(nz(bxBotBar, bar_index), nz(bxCapBar, bar_index))
+        if not na(anchor) and not na(origin)
+            float leg = math.abs(anchor - origin)
+            if leg > 0 and leg >= t3Min * nz(atr, 0)
+                float d1 = origin + (anchor - origin) / 3.0        // F3 / M3 boundary
+                float d2 = origin + 2.0 * (anchor - origin) / 3.0  // M3 / N3 boundary
+                int   x2 = bar_index + t3Ext
+                // Bands are assigned by GEOMETRY, not by which variable happens to be the
+                // anchor. N3 is always the third that CONTAINS the anchor, so in a downtrend
+                // it sits at the bottom. The old version drew it on top either way.
+                float hiB = math.max(anchor, origin)
+                float loB = math.min(anchor, origin)
+                float st3 = (hiB - loB) / 3.0
+                float bnd1 = loB + st3
+                float bnd2 = loB + 2.0 * st3
+                bool  anchorTop = anchor >= origin
+                color cTop = anchorTop ? t3N : t3F
+                color cBot = anchorTop ? t3F : t3N
+                t3a := line.new(f_lx(b0), hiB,  x2, hiB,  color = color.new(cTop, 40), width = t3W, style = f_style(t3St))
+                t3b := line.new(f_lx(b0), bnd2, x2, bnd2, color = color.new(cTop, 20), width = t3W, style = f_style(t3St))
+                t3c := line.new(f_lx(b0), bnd1, x2, bnd1, color = color.new(cBot, 20), width = t3W, style = f_style(t3St))
+                t3d := line.new(f_lx(b0), loB,  x2, loB,  color = color.new(cBot, 40), width = t3W, style = f_style(t3St))
+                if t3Fill
+                    linefill.delete(t3f1), linefill.delete(t3f2), linefill.delete(t3f3)
+                    t3f1 := linefill.new(t3a, t3b, color.new(cTop, t3Op))
+                    t3f2 := linefill.new(t3b, t3c, color.new(t3M,  t3Op))
+                    t3f3 := linefill.new(t3c, t3d, color.new(cBot, t3Op))
+
+alertcondition(oAdded, "Outer pivot", "Outer structure printed a new pivot")
+alertcondition(iAdded, "Inner pivot", "Inner structure printed a new pivot")
